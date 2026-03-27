@@ -1,0 +1,24 @@
+{
+  "name": "sdlc-bot",
+  "version": "1.0.0",
+  "description": "SDLC Environment Reservation Bot for Slack",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "node test-validation.js && node test-signature.js",
+    "health": "curl http://localhost:3000/health"
+  },
+  "keywords": ["slack", "bot", "environment", "devops", "sdlc"],
+  "author": "Hannah de los Reyes",
+  "license": "ISC",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {
+    "@slack/web-api": "^7.9.1",
+    "body-parser": "^2.2.0",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0"
+  }
+}

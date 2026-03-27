@@ -1,0 +1,24 @@
+# Environment Variables Template for SDLC Bot
+
+# Required Variables
+SLACK_BOT_TOKEN=xoxb-your-bot-token-here
+SLACK_SIGNING_SECRET=your-signing-secret-here
+
+# Optional Variables  
+PORT=3000
+MONITORED_CHANNELS=C1234567890,C0987654321
+
+# How to get these values:
+# 1. SLACK_BOT_TOKEN: Go to your Slack app → "OAuth & Permissions" → "Bot User OAuth Token"
+# 2. SLACK_SIGNING_SECRET: Go to your Slack app → "Basic Information" → "Signing Secret"
+# 3. MONITORED_CHANNELS: Channel IDs where bot should check for expired reservations on startup
+#    - Get channel ID from Slack: right-click channel → "Copy link" → extract ID from URL
+#    - Format: C1234567890,C0987654321 (comma-separated, no spaces)
+
+# Docker example:
+# docker run -e SLACK_BOT_TOKEN=xoxb-... -e SLACK_SIGNING_SECRET=abc123... sdlc-bot
+
+# Traditional server example:
+# export SLACK_BOT_TOKEN=xoxb-...
+# export SLACK_SIGNING_SECRET=abc123...
+# npm start 
