@@ -90,10 +90,10 @@ When you need to update:
 **After deployment, configure these Slack settings:**
 
 ### Slash Commands
-- `/env-request` → `https://your-domain.com/slack/slash-commands`
-- `/env-release` → `https://your-domain.com/slack/slash-commands`
-- `/env-leave-queue` → `https://your-domain.com/slack/slash-commands`
-- `/env-status` → `https://your-domain.com/slack/slash-commands`
+- `/env-request` → `https://your-domain.com/env-request`
+- `/env-release` → `https://your-domain.com/env-release`
+- `/env-leave-queue` → `https://your-domain.com/env-leave-queue`
+- `/env-status` → `https://your-domain.com/env-status`
 
 ### Interactive Components
 - Request URL: `https://your-domain.com/slack/interactions`

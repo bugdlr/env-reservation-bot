@@ -4,7 +4,7 @@ A Slack bot for managing shared environment reservations. Teams can reserve, que
 
 ## Features
 
-- **Reserve environments** with optional duration (defaults to 1 hour)
+- **Reserve environments** with optional duration (defaults to 2 hours)
 - **Automatic queue** when an environment is occupied — next in line gets notified
 - **Auto-release** after the reservation expires
 - **Reminders** sent via DM before expiration
@@ -32,14 +32,14 @@ Under **OAuth & Permissions**, add these Bot Token Scopes:
 
 ### 3. Create Slash Commands
 
-Under **Slash Commands**, create these four commands, all pointing to `https://your-domain.com/slack/slash-commands`:
+Under **Slash Commands**, create these four commands. Each one's Request URL is its own path:
 
-| Command | Description |
-|---------|-------------|
-| `/env-request` | Reserve an environment or join the queue |
-| `/env-release` | Release your current reservation |
-| `/env-leave-queue` | Leave the waiting queue |
-| `/env-status` | Show current environment status |
+| Command | Request URL | Description |
+|---------|-------------|-------------|
+| `/env-request` | `https://your-domain.com/env-request` | Reserve an environment or join the queue |
+| `/env-release` | `https://your-domain.com/env-release` | Release your current reservation |
+| `/env-leave-queue` | `https://your-domain.com/env-leave-queue` | Leave the waiting queue |
+| `/env-status` | `https://your-domain.com/env-status` | Show current environment status |
 
 ### 4. Enable Interactivity
 

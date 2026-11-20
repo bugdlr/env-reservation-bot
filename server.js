@@ -2070,28 +2070,20 @@ async function notifyQueueMembersOfUpdate(oldQueue, departedUserName, channel_id
     }
 }
 
-// Add a test endpoint to verify bot permissions
-app.post("/test-dm", async (req, res) => {
-    const { user_id } = req.body;
-    
-    try {
-        // Test bot token
-        const auth = await web.auth.test();
-        
-        // Try to open DM
-        const conv = await web.conversations.open({ users: user_id });
-        
-        // Try to send message
-        const msg = await web.chat.postMessage({
-            channel: conv.channel.id,
-            text: "Test message - checking bot permissions"
-        });
-        
-        return res.send("Test completed successfully - check logs");
-    } catch (error) {
-        console.error('Test failed:', error);
-        return res.send(`Test failed: ${error.message}`);
+app.post("/env-status", verifySlackSignature, rateLimitMiddleware, (req, res) => {
+    const { channel_id } = req.body;
+
+    if (!channel_id || channel_id.startsWith('D')) {
+        return res.send("⚠️ Please run `/env-status` in a channel, not in a direct message.");
     }
+
+    const text = buildPinnedMessageContent(
+        getCurrentReservation(channel_id),
+        getQueue(channel_id),
+        getScheduledReservations(channel_id),
+        getPendingHandoff(channel_id)
+    );
+    return res.send(text.split(`\n${RECOVERY_PREFIX}`)[0]);
 });
 
 // Update pinned message and post queue status when queue changes
