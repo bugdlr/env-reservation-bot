@@ -151,6 +151,8 @@ app.get('/ready', (req, res) => {
 // Per-channel state storage
 let reservations = {};  // { "C1234": { user_id, user_name, ... }, "C5678": null }
 let queues = {};       // { "C1234": [...], "C5678": [...] }
+let scheduledReservations = {}; // { channelId: [ { user_id, user_name, duration, channel_id, scheduledTime, timezone, scheduledTimer }, ... ] }
+let pendingHandoffs = {}; // { channelId: { user_id, user_name, duration, graceTimer } }
 let pinnedMessageTs = {};  // { "C1234": "1234567890.123456" } - loaded from file on startup
 
 // Pinned message ts persistence
@@ -216,13 +218,76 @@ function getNextInQueue(channel_id) {
     return queues[channel_id].shift();
 }
 
+// Scheduled reservation accessors
+function getScheduledReservations(channel_id) {
+    return scheduledReservations[channel_id] || [];
+}
+
+function getNextScheduledReservation(channel_id) {
+    const arr = scheduledReservations[channel_id];
+    return (arr && arr.length > 0) ? arr[0] : null;
+}
+
+function addScheduledReservation(channel_id, obj) {
+    if (!scheduledReservations[channel_id]) {
+        scheduledReservations[channel_id] = [];
+    }
+    const newStart = obj.scheduledTime;
+    const newEnd = newStart + obj.duration * 60000;
+    for (const entry of scheduledReservations[channel_id]) {
+        const existingStart = entry.scheduledTime;
+        const existingEnd = existingStart + entry.duration * 60000;
+        if (newStart < existingEnd && newEnd > existingStart) {
+            throw new Error(`Time conflict: overlaps with <@${entry.user_id}>'s reservation at ${formatScheduledTime(entry.scheduledTime, entry.timezone || 'America/Los_Angeles')}`);
+        }
+    }
+    scheduledReservations[channel_id].push(obj);
+    scheduledReservations[channel_id].sort((a, b) => a.scheduledTime - b.scheduledTime);
+}
+
+function removeScheduledReservation(channel_id, user_id) {
+    if (!scheduledReservations[channel_id]) return;
+    const idx = scheduledReservations[channel_id].findIndex(s => s.user_id === user_id);
+    if (idx !== -1) {
+        const entry = scheduledReservations[channel_id][idx];
+        if (entry.scheduledTimer) clearTimeout(entry.scheduledTimer);
+        scheduledReservations[channel_id].splice(idx, 1);
+    }
+}
+
+function clearAllScheduledReservations(channel_id) {
+    if (!scheduledReservations[channel_id]) return;
+    for (const entry of scheduledReservations[channel_id]) {
+        if (entry.scheduledTimer) clearTimeout(entry.scheduledTimer);
+    }
+    scheduledReservations[channel_id] = [];
+}
+
+// Pending handoff accessors
+function getPendingHandoff(channel_id) {
+    return pendingHandoffs[channel_id] || null;
+}
+
+function setPendingHandoff(channel_id, handoff) {
+    pendingHandoffs[channel_id] = handoff;
+}
+
+function clearPendingHandoff(channel_id) {
+    const handoff = pendingHandoffs[channel_id];
+    if (handoff && handoff.graceTimer) clearTimeout(handoff.graceTimer);
+    delete pendingHandoffs[channel_id];
+}
+
 // Startup recovery function - restore from pinned message
 async function recoverReservationState() {
     console.log('🔄 Checking for expired reservations from previous session...');
     loadPinnedMessageTs();
 
-    const monitoredChannels = process.env.MONITORED_CHANNELS ?
-        process.env.MONITORED_CHANNELS.split(',') : [];
+    const configuredChannels = process.env.MONITORED_CHANNELS
+        ? process.env.MONITORED_CHANNELS.split(',').map(c => c.trim())
+        : [];
+    const storedChannels = Object.keys(pinnedMessageTs);
+    const monitoredChannels = [...new Set([...configuredChannels, ...storedChannels])];
 
     if (monitoredChannels.length === 0) {
         console.log('⚠️ No monitored channels configured. Set MONITORED_CHANNELS=C1234,C5678 in .env');
@@ -262,10 +327,35 @@ async function recoverReservationState() {
 
             if (parsed.available) {
                 console.log(`✅ Channel ${ch} already available`);
+                // Still recover any scheduled reservations
+                if (parsed.scheduled && parsed.scheduled.length > 0) {
+                    for (const entry of parsed.scheduled) {
+                        if (entry.scheduledTime > Date.now()) {
+                            const msUntilActivation = entry.scheduledTime - Date.now();
+                            const scheduledEntry = {
+                                user_id: entry.user_id,
+                                user_name: entry.user_name,
+                                duration: entry.duration,
+                                channel_id: ch,
+                                scheduledTime: entry.scheduledTime,
+                                timezone: entry.timezone,
+                                scheduledTimer: setTimeout(() => activateScheduledReservation(ch, entry.user_id), msUntilActivation)
+                            };
+                            try {
+                                addScheduledReservation(ch, scheduledEntry);
+                                console.log(`📅 Recovered scheduled reservation for ${entry.user_name}`);
+                            } catch (e) {
+                                console.warn(`⚠️ Could not recover scheduled: ${e.message}`);
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
-            const isExpired = await isReservationExpired(parsed.timeString);
+            const isExpired = parsed.epoch
+                ? parsed.epoch <= Date.now()
+                : await isReservationExpired(parsed.timeString);
             if (isExpired) {
                 if (parsed.queue.length > 0) {
                     console.log(`⏰ Reservation expired, giving to next in queue (${parsed.queue.length} waiting)`);
@@ -294,22 +384,50 @@ async function recoverReservationState() {
             } else {
                 console.log(`✅ Reservation still valid - restoring to memory`);
                 activeCount++;
-                const expirationTime = parseTopicExpiration(parsed.timeString);
+                const expirationTime = parsed.epoch || parseTopicExpiration(parsed.timeString);
                 if (expirationTime && expirationTime > Date.now()) {
                     const msUntilRelease = expirationTime - Date.now();
                     for (const e of parsed.queue) addToQueue(ch, e);
                     setCurrentReservation(ch, {
                         user_id: parsed.user_id,
-                        user_name: 'User',
+                        user_name: parsed.user_name || 'User',
                         channel_id: ch,
                         expirationTime,
                         reservedAt: Date.now() - (msUntilRelease - 0),
-                        reminderTimer: null,
+                        reminderTimer: msUntilRelease > 10 * 60 * 1000
+                            ? setTimeout(() => remindUserToExtend(parsed.user_id, ch), msUntilRelease - 10 * 60 * 1000)
+                            : null,
                         releaseTimer: setTimeout(
                             () => autoReleaseIfNoResponse(parsed.user_id, ch),
                             msUntilRelease
                         )
                     });
+                }
+            }
+
+            // Recover scheduled reservations
+            if (parsed.scheduled && parsed.scheduled.length > 0) {
+                for (const entry of parsed.scheduled) {
+                    if (entry.scheduledTime > Date.now()) {
+                        const msUntilActivation = entry.scheduledTime - Date.now();
+                        const scheduledEntry = {
+                            user_id: entry.user_id,
+                            user_name: entry.user_name,
+                            duration: entry.duration,
+                            channel_id: ch,
+                            scheduledTime: entry.scheduledTime,
+                            timezone: entry.timezone,
+                            scheduledTimer: setTimeout(() => activateScheduledReservation(ch, entry.user_id), msUntilActivation)
+                        };
+                        try {
+                            addScheduledReservation(ch, scheduledEntry);
+                            console.log(`📅 Recovered scheduled reservation for ${entry.user_name} at ${new Date(entry.scheduledTime).toISOString()}`);
+                        } catch (e) {
+                            console.warn(`⚠️ Could not recover scheduled reservation for ${entry.user_name}: ${e.message}`);
+                        }
+                    } else {
+                        console.log(`⏭️ Scheduled reservation for ${entry.user_name} passed during downtime — skipping`);
+                    }
                 }
             }
         } catch (error) {
@@ -409,6 +527,32 @@ function formatEndTime(durationMinutes) {
     return `${ptTime} PST / ${etTime} EST`;
 }
 
+// Format a scheduled time as human-readable (e.g., "3:00 PM today")
+function formatScheduledTime(epochMs, timezone) {
+    const tz = timezone || 'America/Los_Angeles';
+    const targetDate = new Date(epochMs);
+    const now = new Date();
+
+    const timeStr = targetDate.toLocaleTimeString('en-US', {
+        timeZone: tz,
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true
+    });
+
+    const todayInTz = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+    const targetInTz = new Date(targetDate.toLocaleString('en-US', { timeZone: tz }));
+
+    const todayDay = new Date(todayInTz.getFullYear(), todayInTz.getMonth(), todayInTz.getDate());
+    const targetDay = new Date(targetInTz.getFullYear(), targetInTz.getMonth(), targetInTz.getDate());
+    const diffDays = Math.round((targetDay - todayDay) / (24 * 60 * 60 * 1000));
+
+    if (diffDays === 0) return `${timeStr} today`;
+    if (diffDays === 1) return `${timeStr} tomorrow`;
+    const dateStr = targetDate.toLocaleDateString('en-US', { timeZone: tz, month: 'short', day: 'numeric' });
+    return `${timeStr} on ${dateStr}`;
+}
+
 // Build topic string (full format, no user_id)
 function buildReservationTopic(user_name, user_id, durationMinutes, queueEntries = []) {
     let topic = `🚀 In use by @${user_name} until ${formatEndTime(durationMinutes)}`;
@@ -424,43 +568,103 @@ const PINNED_MARKER = '📌 *Environment Reservation Status*';
 const RECOVERY_PREFIX = '_Recovery Data: ';
 const RECOVERY_SUFFIX = '_';
 
-function buildPinnedMessageContent(reservation, queueEntries = []) {
-    if (!reservation) {
-        return `${PINNED_MARKER}\n\n*Status:* ✅ Available`;
+function buildPinnedMessageContent(reservation, queueEntries = [], scheduledEntries = [], pendingHandoff = null) {
+    let text = `${PINNED_MARKER}\n\n`;
+
+    if (pendingHandoff) {
+        text += `*Status:* ⏳ Handoff pending to <@${pendingHandoff.user_id}>\n`;
+    } else if (!reservation) {
+        text += `*Status:* ✅ Available\n`;
+    } else {
+        const timeStr = formatEndTime(Math.ceil((reservation.expirationTime - Date.now()) / (60 * 1000)));
+        text += `*In use by:* <@${reservation.user_id}>\n*Expires:* ${timeStr}\n`;
+        if (queueEntries && queueEntries.length > 0) {
+            text += `\n*Queue:*\n`;
+            queueEntries.forEach((e, i) => {
+                text += `${i + 1}. <@${e.user_id}> (${formatDuration(e.duration)})\n`;
+            });
+        }
     }
-    const timeStr = formatEndTime(Math.ceil((reservation.expirationTime - Date.now()) / (60 * 1000)));
-    let text = `${PINNED_MARKER}\n\n*In use by:* <@${reservation.user_id}>\n*Expires:* ${timeStr}\n`;
-    if (queueEntries && queueEntries.length > 0) {
-        text += `\n*Queue:*\n`;
-        queueEntries.forEach((e, i) => {
-            text += `${i + 1}. <@${e.user_id}> (${formatDuration(e.duration)})\n`;
+
+    if (scheduledEntries && scheduledEntries.length > 0) {
+        text += `\n*Scheduled:*\n`;
+        scheduledEntries.forEach((e, i) => {
+            const timeDisplay = formatScheduledTime(e.scheduledTime, e.timezone);
+            text += `${i + 1}. <@${e.user_id}> at ${timeDisplay} (${formatDuration(e.duration)})\n`;
         });
     }
-    const holderPart = `Holder <@${reservation.user_id}>`;
-    const expiresPart = `Expires ${timeStr}`;
-    const queuePart = (queueEntries || []).length > 0
-        ? (queueEntries || []).map(e => `<@${e.user_id}> ${e.duration} min (${(e.user_name || 'User').replace(/[|·;]/g, ' ')})`).join(' · ')
-        : '';
-    const recovery = queuePart
-        ? `${holderPart} · ${expiresPart} · Queue: ${queuePart}`
-        : `${holderPart} · ${expiresPart}`;
-    text += `\n${RECOVERY_PREFIX}${recovery}${RECOVERY_SUFFIX}`;
+
+    // Build recovery data
+    let recovery = '';
+    if (reservation) {
+        const timeStr = formatEndTime(Math.ceil((reservation.expirationTime - Date.now()) / (60 * 1000)));
+        const safeUserName = (reservation.user_name || 'User').replace(/[|·;()]/g, ' ').trim();
+        const holderPart = `Holder <@${reservation.user_id}> (${safeUserName})`;
+        const expiresPart = `Expires ${reservation.expirationTime} · Display ${timeStr}`;
+        const queuePart = (queueEntries || []).length > 0
+            ? (queueEntries || []).map(e => `<@${e.user_id}> ${e.duration} min (${(e.user_name || 'User').replace(/[|·;]/g, ' ')})`).join(' · ')
+            : '';
+        recovery = queuePart
+            ? `${holderPart} · ${expiresPart} · Queue: ${queuePart}`
+            : `${holderPart} · ${expiresPart}`;
+    }
+
+    if (scheduledEntries && scheduledEntries.length > 0) {
+        const scheduledPart = scheduledEntries.map(e => {
+            const safeName = (e.user_name || 'User').replace(/[|·;()]/g, ' ').trim();
+            return `<@${e.user_id}> (${safeName}) at ${e.scheduledTime} for ${e.duration} min in ${e.timezone || 'America/Los_Angeles'}`;
+        }).join(' | ');
+        recovery += (recovery ? ' · ' : '') + `Scheduled: ${scheduledPart}`;
+    }
+
+    if (recovery) {
+        text += `\n${RECOVERY_PREFIX}${recovery}${RECOVERY_SUFFIX}`;
+    }
+
     return text;
 }
 
-// Parse pinned message for recovery. Returns { user_id, user_name, timeString, queue } or null
+// Parse pinned message for recovery. Returns { user_id, user_name, timeString, queue, scheduled } or null
 function parsePinnedMessageContent(text) {
     if (!text || !text.includes(PINNED_MARKER)) return null;
-    if (text.includes('*Status:* ✅ Available')) return { available: true };
+
+    // Parse scheduled entries from recovery data first (needed for both available and in-use cases)
     const escaped = RECOVERY_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const dataMatch = text.match(new RegExp(escaped + '([^_]+)' + RECOVERY_SUFFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    const dataMatch = text.match(new RegExp(escaped + '(.+)' + RECOVERY_SUFFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'm'));
+
+    const scheduled = [];
+    if (dataMatch) {
+        const scheduledMatch = dataMatch[1].match(/Scheduled: (.+?)$/);
+        if (scheduledMatch) {
+            scheduledMatch[1].split(' | ').forEach(entry => {
+                const m = entry.match(/<@(U[A-Z0-9]+)> \(([^)]+)\) at (\d{10,}) for (\d+) min in (.+)/);
+                if (m) {
+                    scheduled.push({
+                        user_id: m[1],
+                        user_name: m[2].trim(),
+                        scheduledTime: parseInt(m[3], 10),
+                        duration: parseInt(m[4], 10),
+                        timezone: m[5].trim()
+                    });
+                }
+            });
+        }
+    }
+
+    if (text.includes('*Status:* ✅ Available') || text.includes('Handoff pending')) {
+        return { available: true, scheduled };
+    }
+
     if (!dataMatch) return null;
     const raw = dataMatch[1];
-    const holderMatch = raw.match(/Holder <@(U[A-Z0-9]+)>/);
-    const expiresMatch = raw.match(/Expires (.+?)(?: · Queue:|$)/s);
-    const queueMatch = raw.match(/Queue: (.+)$/);
+    const holderMatch = raw.match(/Holder <@(U[A-Z0-9]+)>(?:\s*\(([^)]+)\))?/);
+    const epochMatch = raw.match(/Expires (\d{10,}) · Display (.+?)(?: · Queue:| · Scheduled:|$)/s);
+    const legacyExpiresMatch = !epochMatch ? raw.match(/Expires (.+?)(?: · Queue:| · Scheduled:|$)/s) : null;
+    const queueMatch = raw.match(/Queue: (.+?)(?:(?: · Scheduled:)|$)/s);
     const userId = holderMatch ? holderMatch[1] : null;
-    const timeStr = expiresMatch ? expiresMatch[1].trim() : null;
+    const userName = holderMatch && holderMatch[2] ? holderMatch[2].trim() : null;
+    const epoch = epochMatch ? parseInt(epochMatch[1], 10) : null;
+    const timeStr = epochMatch ? epochMatch[2].trim() : (legacyExpiresMatch ? legacyExpiresMatch[1].trim() : null);
     const queue = [];
     if (queueMatch && queueMatch[1]) {
         queueMatch[1].split(' · ').forEach(entry => {
@@ -474,15 +678,17 @@ function parsePinnedMessageContent(text) {
             }
         });
     }
-    if (!userId || !timeStr) return null;
-    return { user_id: userId, timeString: timeStr, queue };
+    if (!userId || (!timeStr && !epoch)) return null;
+    return { user_id: userId, user_name: userName, epoch, timeString: timeStr, queue, scheduled };
 }
 
 // Create or update pinned message and topic
 async function updatePinnedMessage(channel_id) {
     const reservation = getCurrentReservation(channel_id);
     const queue = getQueue(channel_id);
-    const content = buildPinnedMessageContent(reservation, queue);
+    const scheduled = getScheduledReservations(channel_id);
+    const pendingHandoff = getPendingHandoff(channel_id);
+    const content = buildPinnedMessageContent(reservation, queue, scheduled, pendingHandoff);
 
     try {
         const ts = pinnedMessageTs[channel_id];
@@ -493,9 +699,17 @@ async function updatePinnedMessage(channel_id) {
             await web.pins.add({ channel: channel_id, timestamp: res.ts });
             savePinnedMessageTs(channel_id, res.ts);
         }
-        const topic = reservation
-            ? buildReservationTopic(reservation.user_name, reservation.user_id, Math.ceil((reservation.expirationTime - Date.now()) / (60 * 1000)), queue)
-            : '✅ Available';
+        let topic;
+        if (pendingHandoff) {
+            topic = `⏳ Handoff pending to @${pendingHandoff.user_name}`;
+        } else if (reservation) {
+            topic = buildReservationTopic(reservation.user_name, reservation.user_id, Math.ceil((reservation.expirationTime - Date.now()) / (60 * 1000)), queue);
+        } else if (scheduled.length > 0) {
+            const next = scheduled[0];
+            topic = `✅ Available | Next: @${next.user_name} at ${formatScheduledTime(next.scheduledTime, next.timezone)}`;
+        } else {
+            topic = '✅ Available';
+        }
         await web.conversations.setTopic({ channel: channel_id, topic });
     } catch (e) {
         if (e.data?.error === 'message_not_found' || e.data?.error === 'channel_not_found') {
@@ -569,6 +783,96 @@ function parseDuration(input) {
     }
 
     return duration;
+}
+
+// Fetch user timezone from Slack profile
+async function getUserTimezone(user_id) {
+    try {
+        const result = await web.users.info({ user: user_id });
+        return result.user?.tz || 'America/Los_Angeles';
+    } catch (e) {
+        console.warn(`Could not fetch timezone for ${user_id}:`, e.message);
+        return 'America/Los_Angeles';
+    }
+}
+
+// Parse "2h at 3:00 PM" into { duration, atText }
+function parseScheduledRequest(text) {
+    if (!text || typeof text !== 'string' || text.trim() === '') {
+        return { duration: 120, atText: null };
+    }
+    const trimmed = text.trim();
+
+    // Case-insensitive split on " at " keyword
+    const atIndex = trimmed.toLowerCase().indexOf(' at ');
+    if (atIndex === -1) {
+        // Check if text starts with "at " (no duration prefix)
+        if (trimmed.toLowerCase().startsWith('at ')) {
+            return { duration: 120, atText: trimmed.substring(3).trim() };
+        }
+        return { duration: parseDuration(trimmed), atText: null };
+    }
+
+    const durationPart = trimmed.substring(0, atIndex).trim();
+    const atText = trimmed.substring(atIndex + 4).trim();
+
+    const duration = durationPart === '' ? 120 : parseDuration(durationPart);
+    return { duration, atText: atText || null };
+}
+
+// Convert time string like "3:00 PM", "15:00", "3pm" to epoch ms
+function parseTimeToEpoch(timeStr, userTimezone) {
+    const tz = userTimezone || 'America/Los_Angeles';
+    const s = timeStr.trim();
+
+    let hours, minutes = 0;
+
+    // Try "3:00 PM" or "3:00PM"
+    const meridiemFull = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+    // Try "3pm" or "3 PM"
+    const meridiemShort = s.match(/^(\d{1,2})\s*(AM|PM)$/i);
+    // Try "15:00" (24h)
+    const military = s.match(/^(\d{1,2}):(\d{2})$/);
+
+    if (meridiemFull) {
+        hours = parseInt(meridiemFull[1], 10);
+        minutes = parseInt(meridiemFull[2], 10);
+        const meridiem = meridiemFull[3].toUpperCase();
+        if (hours < 1 || hours > 12) throw new Error(`Invalid hour: ${hours}`);
+        if (minutes < 0 || minutes > 59) throw new Error(`Invalid minutes: ${minutes}`);
+        if (meridiem === 'PM' && hours !== 12) hours += 12;
+        else if (meridiem === 'AM' && hours === 12) hours = 0;
+    } else if (meridiemShort) {
+        hours = parseInt(meridiemShort[1], 10);
+        const meridiem = meridiemShort[2].toUpperCase();
+        if (hours < 1 || hours > 12) throw new Error(`Invalid hour: ${hours}`);
+        if (meridiem === 'PM' && hours !== 12) hours += 12;
+        else if (meridiem === 'AM' && hours === 12) hours = 0;
+    } else if (military) {
+        hours = parseInt(military[1], 10);
+        minutes = parseInt(military[2], 10);
+        if (hours < 0 || hours > 23) throw new Error(`Invalid hour: ${hours}`);
+        if (minutes < 0 || minutes > 59) throw new Error(`Invalid minutes: ${minutes}`);
+    } else {
+        throw new Error(`Invalid time format: "${s}". Use formats like "3:00 PM", "15:00", or "3pm".`);
+    }
+
+    // Get "now" in user's timezone
+    const now = new Date();
+    const nowInTz = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+
+    // Build target date in user's timezone for today
+    const target = new Date(nowInTz);
+    target.setHours(hours, minutes, 0, 0);
+
+    // If the target time is in the past (or within 2 minutes), bump to tomorrow
+    if (target <= nowInTz) {
+        target.setDate(target.getDate() + 1);
+    }
+
+    // Convert back to UTC epoch: offset = nowInTz - now (in ms)
+    const tzOffset = nowInTz.getTime() - now.getTime();
+    return target.getTime() - tzOffset;
 }
 
 app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, res) => {
@@ -652,25 +956,73 @@ app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, 
     
     // Check for empty command
     if (!text || text.trim() === '') {
-        return res.send("Usage: /env-request [duration]\nExamples:\n• `/env-request 30min`\n• `/env-request 2 hours`\n• `/env-request` (defaults to 2 hours)");
+        return res.send("Usage: /env-request [duration] [at time]\nExamples:\n• `/env-request 30min`\n• `/env-request 2 hours`\n• `/env-request 2h at 3:00 PM`\n• `/env-request` (defaults to 2 hours)");
     }
 
-    let duration;
+    // Check if there's a pending handoff
+    const pendingHandoff = getPendingHandoff(channel_id);
+    if (pendingHandoff && pendingHandoff.user_id !== user_id) {
+        return res.send(`⚠️ Environment is being handed off to <@${pendingHandoff.user_id}>. Please wait or join the queue.`);
+    }
+
+    let duration, atText;
     try {
-        duration = parseDuration(text);
+        ({ duration, atText } = parseScheduledRequest(text));
     } catch (error) {
         return res.send(`⚠️ ${error.message}`);
     }
 
+    // Handle scheduled (future) reservation
+    if (atText) {
+        try {
+            const userTimezone = await getUserTimezone(user_id);
+            const scheduledTime = parseTimeToEpoch(atText, userTimezone);
+
+            // Check overlap with current active reservation
+            if (currentReservation) {
+                const scheduledEnd = scheduledTime + duration * 60000;
+                if (scheduledTime < currentReservation.expirationTime && scheduledEnd > Date.now()) {
+                    return res.send(`⚠️ Your scheduled reservation overlaps with the current active reservation (expires ${formatScheduledTime(currentReservation.expirationTime, userTimezone)}).`);
+                }
+            }
+
+            // addScheduledReservation validates no overlap with other scheduled windows
+            const entry = {
+                user_id,
+                user_name,
+                duration,
+                channel_id,
+                scheduledTime,
+                timezone: userTimezone,
+                scheduledTimer: null
+            };
+            addScheduledReservation(channel_id, entry);
+
+            // Set the activation timer
+            const msUntilActivation = scheduledTime - Date.now();
+            entry.scheduledTimer = setTimeout(() => activateScheduledReservation(channel_id, user_id), msUntilActivation);
+
+            await updatePinnedMessage(channel_id);
+            const timeDisplay = formatScheduledTime(scheduledTime, userTimezone);
+            await web.chat.postMessage({
+                channel: channel_id,
+                text: `📅 <@${user_id}> scheduled a reservation for ${timeDisplay} (${formatDuration(duration)})`
+            });
+            return res.send("");
+        } catch (error) {
+            return res.send(`⚠️ ${error.message}`);
+        }
+    }
+
     // Check if environment is already reserved
     if (currentReservation !== null) {
-        try {            
+        try {
             const conversationResponse = await web.conversations.open({
                 users: user_id
             });
-            
+
             const dmChannelId = conversationResponse.channel.id;
-            
+
             await web.chat.postMessage({
                 channel: dmChannelId,
                 text: `⚠️ Currently in use. Join queue?`,
@@ -691,7 +1043,7 @@ app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, 
                                     "type": "plain_text",
                                     "text": "Join Queue"
                                 },
-                                "value": JSON.stringify({ 
+                                "value": JSON.stringify({
                                     duration,
                                     channel_id
                                 }),
@@ -711,17 +1063,71 @@ app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, 
                     }
                 ]
             });
-            
+
             await web.chat.postMessage({
                 channel: channel_id,
                 text: `⚠️ Environment is currently in use by @${currentReservation.user_name}. Check your DMs to join the queue.`
             });
-            
+
             await printQueueStatus(channel_id);
             return res.send("");
         } catch (error) {
             console.error('Error sending DM:', error);
             return res.send(`⚠️ Error: ${error.message}`);
+        }
+    }
+
+    // Check if immediate reservation would conflict with a scheduled one
+    const nextScheduled = getNextScheduledReservation(channel_id);
+    if (nextScheduled && nextScheduled.user_id !== user_id) {
+        const now = Date.now();
+        const requestedEnd = now + duration * 60000;
+        if (requestedEnd > nextScheduled.scheduledTime) {
+            const maxMinutes = Math.floor((nextScheduled.scheduledTime - now) / 60000);
+            if (maxMinutes < 5) {
+                return res.send(`⚠️ A scheduled reservation by <@${nextScheduled.user_id}> starts too soon (${formatScheduledTime(nextScheduled.scheduledTime, nextScheduled.timezone)}). Please wait or schedule for later.`);
+            }
+            // DM user with option to reserve for shorter duration
+            try {
+                const conversationResponse = await web.conversations.open({ users: user_id });
+                const dmChannelId = conversationResponse.channel.id;
+                const scheduledTimeStr = formatScheduledTime(nextScheduled.scheduledTime, nextScheduled.timezone);
+                await web.chat.postMessage({
+                    channel: dmChannelId,
+                    text: `⚠️ A scheduled reservation starts at ${scheduledTimeStr}. You can reserve for up to ${maxMinutes} minutes.`,
+                    blocks: [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": `⚠️ A scheduled reservation by <@${nextScheduled.user_id}> starts at ${scheduledTimeStr}.\n\nYou requested ${formatDuration(duration)}, but only ${maxMinutes} minutes are available.`
+                            }
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": `Reserve for ${maxMinutes} min` },
+                                    "value": JSON.stringify({ duration: maxMinutes, channel_id }),
+                                    "action_id": "reserve_capped_duration",
+                                    "style": "primary"
+                                },
+                                {
+                                    "type": "button",
+                                    "text": { "type": "plain_text", "text": "No thanks" },
+                                    "value": JSON.stringify({ channel_id }),
+                                    "action_id": "cancel_queue"
+                                }
+                            ]
+                        }
+                    ]
+                });
+                return res.send("");
+            } catch (error) {
+                console.error('Error sending capped duration DM:', error);
+                return res.send(`⚠️ Error: ${error.message}`);
+            }
         }
     }
 
@@ -756,49 +1162,45 @@ app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, 
 });
 
 app.post("/env-release", verifySlackSignature, rateLimitMiddleware, async (req, res) => {
-    const { channel_id } = req.body; // Get channel_id dynamically
+    const { user_id, channel_id } = req.body;
 
     if (!channel_id || channel_id.startsWith('D')) {
         return res.send("⚠️ Please run `/env-release` in a channel, not in a direct message.");
     }
-    
-    console.log(`📤 /env-release in channel ${channel_id}`);
 
-    const queue = getQueue(channel_id);
-    
-    if (queue.length > 0) {
-        const nextUser = getNextInQueue(channel_id);
-        
-        const newReservation = {
-            user_id: nextUser.user_id,
-            user_name: nextUser.user_name,
-            duration: nextUser.duration,
-            channel_id: channel_id,
-            expirationTime: Date.now() + (nextUser.duration * 60 * 1000),
-            reminderTimer: nextUser.duration > 60 ? setTimeout(
-                () => remindUserToExtend(nextUser.user_id, channel_id),
-                nextUser.duration * 60 * 1000 - (10 * 60 * 1000)  // 10 minutes before end
-            ) : null,
-            releaseTimer: setTimeout(
-                () => autoReleaseIfNoResponse(nextUser.user_id, channel_id),
-                nextUser.duration * 60 * 1000
-            )
-        };
-        
-        setCurrentReservation(channel_id, newReservation);
-    
-        await web.chat.postMessage({
-            channel: nextUser.user_id,
-            text: `✅ The environment is now yours!`
-        });
-    
-        await updatePinnedMessage(channel_id);
-        return res.send("");
-    } else {
+    console.log(`📤 /env-release from @${user_id} in channel ${channel_id}`);
+
+    const currentReservation = getCurrentReservation(channel_id);
+
+    // If user has the active reservation, release it
+    if (currentReservation && currentReservation.user_id === user_id) {
+        if (currentReservation.releaseTimer) clearTimeout(currentReservation.releaseTimer);
+        if (currentReservation.reminderTimer) clearTimeout(currentReservation.reminderTimer);
         clearCurrentReservation(channel_id);
-        await updatePinnedMessage(channel_id);
+
+        const queue = getQueue(channel_id);
+        if (queue.length > 0) {
+            const nextUser = getNextInQueue(channel_id);
+            await initiateHandoff(channel_id, nextUser);
+        } else {
+            await updatePinnedMessage(channel_id);
+        }
         return res.send("");
     }
+
+    // If user has no active reservation, check for scheduled
+    const userScheduled = getScheduledReservations(channel_id).find(s => s.user_id === user_id);
+    if (userScheduled) {
+        removeScheduledReservation(channel_id, user_id);
+        await updatePinnedMessage(channel_id);
+        await web.chat.postMessage({
+            channel: channel_id,
+            text: `📅 <@${user_id}> cancelled their scheduled reservation.`
+        });
+        return res.send("");
+    }
+
+    return res.send("⚠️ You don't have an active or scheduled reservation to release.");
 });
 
 async function remindUserToExtend(user_id, channel_id) {
@@ -916,7 +1318,153 @@ app.post("/slack/interactions", verifySlackSignature, rateLimitMiddleware, bodyP
             await printQueueStatus(originalChannelId);
             return res.send("");
         }
-        
+
+        if (actions[0].action_id === "reserve_capped_duration") {
+            const buttonValue = JSON.parse(actions[0].value);
+            const { duration, channel_id } = buttonValue;
+            const currentReservation = getCurrentReservation(channel_id);
+            if (currentReservation) {
+                await web.chat.postMessage({
+                    channel: user.id,
+                    text: `⚠️ The environment is no longer available — someone else has it now.`
+                });
+                return res.send("");
+            }
+            const newReservation = {
+                user_id: user.id,
+                user_name: user.name,
+                duration,
+                channel_id,
+                expirationTime: Date.now() + duration * 60000,
+                reservedAt: Date.now(),
+                reminderTimer: duration > 60 ? setTimeout(() => remindUserToExtend(user.id, channel_id), duration * 60000 - 10 * 60000) : null,
+                releaseTimer: setTimeout(() => autoReleaseIfNoResponse(user.id, channel_id), duration * 60000)
+            };
+            setCurrentReservation(channel_id, newReservation);
+            await updatePinnedMessage(channel_id);
+            await web.chat.postMessage({ channel: user.id, text: `✅ Reserved for ${formatDuration(duration)}.` });
+            await web.chat.postMessage({ channel: channel_id, text: `🚀 <@${user.id}> reserved the environment for ${formatDuration(duration)}.` });
+            await printQueueStatus(channel_id);
+            return res.send("");
+        }
+
+        if (actions[0].action_id === "handoff_accept") {
+            const buttonValue = JSON.parse(actions[0].value);
+            const { channel_id, duration } = buttonValue;
+            const handoff = getPendingHandoff(channel_id);
+            if (!handoff || handoff.user_id !== user.id) {
+                await web.chat.postMessage({ channel: user.id, text: `ℹ️ That handoff is no longer active.` });
+                return res.send("");
+            }
+            clearPendingHandoff(channel_id);
+            const newReservation = {
+                user_id: user.id,
+                user_name: user.name,
+                duration,
+                channel_id,
+                expirationTime: Date.now() + duration * 60000,
+                reservedAt: Date.now(),
+                reminderTimer: duration > 60 ? setTimeout(() => remindUserToExtend(user.id, channel_id), duration * 60000 - 10 * 60000) : null,
+                releaseTimer: setTimeout(() => autoReleaseIfNoResponse(user.id, channel_id), duration * 60000)
+            };
+            setCurrentReservation(channel_id, newReservation);
+            await reconcileQueueWithScheduled(channel_id, newReservation);
+            await web.chat.postMessage({ channel: user.id, text: `✅ The environment is now yours! (${formatDuration(duration)})` });
+            await updatePinnedMessage(channel_id);
+            await printQueueStatus(channel_id);
+            return res.send("");
+        }
+
+        if (actions[0].action_id === "handoff_schedule") {
+            const buttonValue = JSON.parse(actions[0].value);
+            const { channel_id, duration } = buttonValue;
+            const handoff = getPendingHandoff(channel_id);
+            if (!handoff || handoff.user_id !== user.id) {
+                await web.chat.postMessage({ channel: user.id, text: `ℹ️ That handoff is no longer active.` });
+                return res.send("");
+            }
+            clearPendingHandoff(channel_id);
+            // Show time offset buttons
+            await web.chat.postMessage({
+                channel: user.id,
+                text: `When would you like to schedule your reservation?`,
+                blocks: [
+                    {
+                        "type": "section",
+                        "text": { "type": "mrkdwn", "text": `When would you like to use the environment? (${formatDuration(duration)})` }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            { "type": "button", "text": { "type": "plain_text", "text": "+1h" }, "value": JSON.stringify({ channel_id, duration, offset: 60 }), "action_id": "handoff_schedule_offset_60" },
+                            { "type": "button", "text": { "type": "plain_text", "text": "+2h" }, "value": JSON.stringify({ channel_id, duration, offset: 120 }), "action_id": "handoff_schedule_offset_120" },
+                            { "type": "button", "text": { "type": "plain_text", "text": "+3h" }, "value": JSON.stringify({ channel_id, duration, offset: 180 }), "action_id": "handoff_schedule_offset_180" }
+                        ]
+                    }
+                ]
+            });
+            // Move to next in queue or mark available
+            const queue = getQueue(channel_id);
+            if (queue.length > 0) {
+                const nextUser = getNextInQueue(channel_id);
+                await initiateHandoff(channel_id, nextUser);
+            } else {
+                await updatePinnedMessage(channel_id);
+            }
+            return res.send("");
+        }
+
+        if (actions[0].action_id.startsWith("handoff_schedule_offset_")) {
+            const buttonValue = JSON.parse(actions[0].value);
+            const { channel_id, duration, offset } = buttonValue;
+            const scheduledTime = Date.now() + offset * 60000;
+            try {
+                const userTimezone = await getUserTimezone(user.id);
+                const entry = {
+                    user_id: user.id,
+                    user_name: user.name,
+                    duration,
+                    channel_id,
+                    scheduledTime,
+                    timezone: userTimezone,
+                    scheduledTimer: setTimeout(() => activateScheduledReservation(channel_id, user.id), offset * 60000)
+                };
+                addScheduledReservation(channel_id, entry);
+                await updatePinnedMessage(channel_id);
+                await web.chat.postMessage({
+                    channel: user.id,
+                    text: `📅 Scheduled! Your reservation will start at ${formatScheduledTime(scheduledTime, userTimezone)} (${formatDuration(duration)}).`
+                });
+            } catch (error) {
+                await web.chat.postMessage({
+                    channel: user.id,
+                    text: `⚠️ Can't schedule — ${error.message}. Try a different time.`
+                });
+            }
+            return res.send("");
+        }
+
+        if (actions[0].action_id === "handoff_pass") {
+            const buttonValue = JSON.parse(actions[0].value);
+            const { channel_id } = buttonValue;
+            const handoff = getPendingHandoff(channel_id);
+            if (!handoff || handoff.user_id !== user.id) {
+                await web.chat.postMessage({ channel: user.id, text: `ℹ️ That handoff is no longer active.` });
+                return res.send("");
+            }
+            clearPendingHandoff(channel_id);
+            await web.chat.postMessage({ channel: user.id, text: `👍 Passed! The environment will go to the next person in line.` });
+            const queue = getQueue(channel_id);
+            if (queue.length > 0) {
+                const nextUser = getNextInQueue(channel_id);
+                await initiateHandoff(channel_id, nextUser);
+            } else {
+                await updatePinnedMessage(channel_id);
+                await web.chat.postMessage({ channel: channel_id, text: `✅ Environment is now available.` });
+            }
+            return res.send("");
+        }
+
         if (actions[0].action_id === "keep_reservation") {
             const buttonValue = JSON.parse(actions[0].value || '{}');
             const channel_id = buttonValue.channel_id || originalChannelId;
@@ -1023,8 +1571,22 @@ app.post("/slack/interactions", verifySlackSignature, rateLimitMiddleware, bodyP
             }
             
             {
+                // Check if extension would conflict with a scheduled reservation
+                const nextScheduled = getNextScheduledReservation(channel_id);
+                if (nextScheduled && nextScheduled.user_id !== user.id) {
+                    const newExpiration = currentReservation.expirationTime + extraTime * 60000;
+                    if (newExpiration > nextScheduled.scheduledTime) {
+                        const scheduledTimeStr = formatScheduledTime(nextScheduled.scheduledTime, nextScheduled.timezone);
+                        await web.chat.postMessage({
+                            channel: user.id,
+                            text: `⚠️ Can't extend — <@${nextScheduled.user_id}> has a scheduled reservation at ${scheduledTimeStr}.`
+                        });
+                        return res.send("");
+                    }
+                }
+
                 const currentTime = Date.now();
-                
+
                 // Update expiration time
                 currentReservation.expirationTime = currentReservation.expirationTime + (extraTime * 60 * 1000);
                 
@@ -1206,29 +1768,180 @@ async function autoReleaseIfNoResponse(user_id, channel_id) {
     await printQueueStatus(channel_id);
 }
 
+// Activate a scheduled reservation when its time arrives
+async function activateScheduledReservation(channel_id, user_id) {
+    const scheduled = getScheduledReservations(channel_id);
+    const entry = scheduled.find(s => s.user_id === user_id);
+    if (!entry) return;
+
+    const currentReservation = getCurrentReservation(channel_id);
+
+    if (currentReservation && currentReservation.user_id === user_id) {
+        // User already holds the env (got it early from queue) — extend
+        const scheduledEnd = entry.scheduledTime + entry.duration * 60000;
+        if (scheduledEnd > currentReservation.expirationTime) {
+            currentReservation.expirationTime = scheduledEnd;
+            if (currentReservation.releaseTimer) clearTimeout(currentReservation.releaseTimer);
+            if (currentReservation.reminderTimer) clearTimeout(currentReservation.reminderTimer);
+            const msUntilRelease = scheduledEnd - Date.now();
+            currentReservation.releaseTimer = setTimeout(() => autoReleaseIfNoResponse(user_id, channel_id), msUntilRelease);
+            currentReservation.reminderTimer = msUntilRelease > 10 * 60 * 1000
+                ? setTimeout(() => remindUserToExtend(user_id, channel_id), msUntilRelease - 10 * 60 * 1000)
+                : null;
+            setCurrentReservation(channel_id, currentReservation);
+        }
+        removeScheduledReservation(channel_id, user_id);
+        await web.chat.postMessage({
+            channel: user_id,
+            text: `📅 Your scheduled time has started — reservation extended until ${formatScheduledTime(currentReservation.expirationTime, entry.timezone)}.`
+        });
+        await updatePinnedMessage(channel_id);
+    } else if (!currentReservation && !getPendingHandoff(channel_id)) {
+        // Env is free — create normal reservation
+        const duration = entry.duration;
+        const newReservation = {
+            user_id: entry.user_id,
+            user_name: entry.user_name,
+            duration,
+            channel_id,
+            expirationTime: Date.now() + duration * 60000,
+            reservedAt: Date.now(),
+            reminderTimer: duration > 60 ? setTimeout(() => remindUserToExtend(user_id, channel_id), duration * 60000 - 10 * 60000) : null,
+            releaseTimer: setTimeout(() => autoReleaseIfNoResponse(user_id, channel_id), duration * 60000)
+        };
+        removeScheduledReservation(channel_id, user_id);
+        setCurrentReservation(channel_id, newReservation);
+        await web.chat.postMessage({ channel: user_id, text: `✅ Your scheduled reservation is now active! (${formatDuration(duration)})` });
+        await web.chat.postMessage({ channel: channel_id, text: `📅 <@${user_id}>'s scheduled reservation is now active.` });
+        await updatePinnedMessage(channel_id);
+    } else {
+        // Env is busy (someone else) — put at front of queue
+        removeScheduledReservation(channel_id, user_id);
+        const queue = getQueue(channel_id);
+        queue.unshift({ user_id: entry.user_id, user_name: entry.user_name, duration: entry.duration, channel_id });
+        await web.chat.postMessage({
+            channel: user_id,
+            text: `⏳ Your scheduled time arrived but the environment is busy. You've been placed at the front of the queue.`
+        });
+        await updatePinnedMessage(channel_id);
+    }
+}
+
+// If a promoted queue user also has a scheduled reservation, extend to cover scheduled window
+async function reconcileQueueWithScheduled(channel_id, newReservation) {
+    const scheduled = getScheduledReservations(channel_id);
+    const entry = scheduled.find(s => s.user_id === newReservation.user_id);
+    if (!entry) return;
+
+    const scheduledEnd = entry.scheduledTime + entry.duration * 60000;
+    if (scheduledEnd > newReservation.expirationTime) {
+        newReservation.expirationTime = scheduledEnd;
+        if (newReservation.releaseTimer) clearTimeout(newReservation.releaseTimer);
+        if (newReservation.reminderTimer) clearTimeout(newReservation.reminderTimer);
+        const msUntilRelease = scheduledEnd - Date.now();
+        newReservation.releaseTimer = setTimeout(() => autoReleaseIfNoResponse(newReservation.user_id, channel_id), msUntilRelease);
+        newReservation.reminderTimer = msUntilRelease > 10 * 60 * 1000
+            ? setTimeout(() => remindUserToExtend(newReservation.user_id, channel_id), msUntilRelease - 10 * 60 * 1000)
+            : null;
+        setCurrentReservation(channel_id, newReservation);
+    }
+    removeScheduledReservation(channel_id, newReservation.user_id);
+    await web.chat.postMessage({
+        channel: newReservation.user_id,
+        text: `📅 You got the env early! Reservation extended to cover your scheduled time until ${formatScheduledTime(newReservation.expirationTime, entry.timezone)}.`
+    });
+}
+
+// Initiate handoff: DM the next queuer with options instead of auto-assigning
+async function initiateHandoff(channel_id, nextUser) {
+    // Set pending handoff state
+    const graceTimer = setTimeout(async () => {
+        // Auto-accept after 3 minutes if no response
+        const handoff = getPendingHandoff(channel_id);
+        if (!handoff || handoff.user_id !== nextUser.user_id) return;
+        clearPendingHandoff(channel_id);
+
+        const newReservation = {
+            user_id: nextUser.user_id,
+            user_name: nextUser.user_name,
+            duration: nextUser.duration,
+            channel_id,
+            expirationTime: Date.now() + nextUser.duration * 60000,
+            reservedAt: Date.now(),
+            reminderTimer: nextUser.duration > 60 ? setTimeout(() => remindUserToExtend(nextUser.user_id, channel_id), nextUser.duration * 60000 - 10 * 60000) : null,
+            releaseTimer: setTimeout(() => autoReleaseIfNoResponse(nextUser.user_id, channel_id), nextUser.duration * 60000)
+        };
+        setCurrentReservation(channel_id, newReservation);
+        await reconcileQueueWithScheduled(channel_id, newReservation);
+        await web.chat.postMessage({
+            channel: nextUser.user_id,
+            text: `⏰ No response received — the environment has been reserved for you (${formatDuration(nextUser.duration)}).`
+        });
+        await updatePinnedMessage(channel_id);
+    }, 3 * 60 * 1000);
+
+    setPendingHandoff(channel_id, {
+        user_id: nextUser.user_id,
+        user_name: nextUser.user_name,
+        duration: nextUser.duration,
+        graceTimer
+    });
+
+    await updatePinnedMessage(channel_id);
+
+    // DM the user with options
+    await web.chat.postMessage({
+        channel: nextUser.user_id,
+        text: `The environment is now available! What would you like to do?`,
+        blocks: [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": `🎉 The environment is now available! What would you like to do?`
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Take it now" },
+                        "value": JSON.stringify({ channel_id, duration: nextUser.duration }),
+                        "action_id": "handoff_accept",
+                        "style": "primary"
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Schedule for later" },
+                        "value": JSON.stringify({ channel_id, duration: nextUser.duration }),
+                        "action_id": "handoff_schedule"
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": "Pass to next person" },
+                        "value": JSON.stringify({ channel_id }),
+                        "action_id": "handoff_pass",
+                        "style": "danger"
+                    }
+                ]
+            }
+        ]
+    });
+}
+
 // Release when stub reservation (no user_id) expires - can't DM holder
 async function releaseEnvironmentStub(channel_id) {
     const currentReservation = getCurrentReservation(channel_id);
     if (!currentReservation || currentReservation.user_id !== null) return;
-    
+
     if (currentReservation.releaseTimer) clearTimeout(currentReservation.releaseTimer);
     clearCurrentReservation(channel_id);
 
     const queue = getQueue(channel_id);
     if (queue.length > 0) {
         const nextUser = getNextInQueue(channel_id);
-        const newReservation = {
-            user_id: nextUser.user_id,
-            user_name: nextUser.user_name,
-            duration: nextUser.duration,
-            channel_id,
-            expirationTime: Date.now() + (nextUser.duration * 60 * 1000),
-            reminderTimer: nextUser.duration > 60 ? setTimeout(() => remindUserToExtend(nextUser.user_id, channel_id), nextUser.duration * 60 * 1000 - (10 * 60 * 1000)) : null,
-            releaseTimer: setTimeout(() => autoReleaseIfNoResponse(nextUser.user_id, channel_id), nextUser.duration * 60 * 1000)
-        };
-        setCurrentReservation(channel_id, newReservation);
-        await web.chat.postMessage({ channel: nextUser.user_id, text: `✅ The environment is now yours!` });
-        await updatePinnedMessage(channel_id);
+        await initiateHandoff(channel_id, nextUser);
     } else {
         await updatePinnedMessage(channel_id);
     }
@@ -1237,7 +1950,7 @@ async function releaseEnvironmentStub(channel_id) {
 // Update releaseEnvironment to handle per-channel state
 async function releaseEnvironment(user_id, channel_id) {
     const currentReservation = getCurrentReservation(channel_id);
-    
+
     if (!currentReservation || currentReservation.user_id !== user_id) {
         return "⚠️ You don't have the environment reserved.";
     }
@@ -1249,7 +1962,7 @@ async function releaseEnvironment(user_id, channel_id) {
     if (currentReservation.reminderTimer) {
         clearTimeout(currentReservation.reminderTimer);
     }
-    
+
     clearCurrentReservation(channel_id);
 
     if (!channel_id) {
@@ -1259,31 +1972,7 @@ async function releaseEnvironment(user_id, channel_id) {
     const queue = getQueue(channel_id);
     if (queue.length > 0) {
         const nextUser = getNextInQueue(channel_id);
-
-        const newReservation = {
-            user_id: nextUser.user_id,
-            user_name: nextUser.user_name,
-            duration: nextUser.duration,
-            channel_id: channel_id,
-            expirationTime: Date.now() + (nextUser.duration * 60 * 1000),
-            reminderTimer: nextUser.duration > 60 ? setTimeout(
-                () => remindUserToExtend(nextUser.user_id, channel_id),
-                nextUser.duration * 60 * 1000 - (10 * 60 * 1000)  // 10 minutes before end
-            ) : null,
-            releaseTimer: setTimeout(
-                () => autoReleaseIfNoResponse(nextUser.user_id, channel_id),
-                nextUser.duration * 60 * 1000
-            )
-        };
-
-        setCurrentReservation(channel_id, newReservation);
-
-        await web.chat.postMessage({
-            channel: nextUser.user_id,
-            text: `✅ The environment is now yours!`
-        });
-
-        await updatePinnedMessage(channel_id);
+        await initiateHandoff(channel_id, nextUser);
         return "";
     }
 
@@ -1432,15 +2121,21 @@ async function printQueueStatus(channel_id) {
 // Graceful shutdown handler
 function gracefulShutdown() {
     console.log('Graceful shutdown initiated');
-    
-    // Clear all active timers
+
+    // Clear all active reservation timers
     Object.values(reservations).forEach(reservation => {
         if (reservation) {
             if (reservation.releaseTimer) clearTimeout(reservation.releaseTimer);
             if (reservation.reminderTimer) clearTimeout(reservation.reminderTimer);
         }
     });
-    
+
+    // Clear all scheduled reservation timers
+    Object.keys(scheduledReservations).forEach(ch => clearAllScheduledReservations(ch));
+
+    // Clear all pending handoff timers
+    Object.keys(pendingHandoffs).forEach(ch => clearPendingHandoff(ch));
+
     console.log('Cleared all active timers');
     process.exit(0);
 }

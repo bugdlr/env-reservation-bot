@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test-validation.js && node test-signature.js",
+    "test": "node test-validation.js && node test-signature.js && node test-scheduling.js",
     "health": "curl http://localhost:3000/health"
   },
   "keywords": ["slack", "bot", "environment", "devops", "sdlc"],
