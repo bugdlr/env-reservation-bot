@@ -1,10 +1,9 @@
 require('dotenv').config();
 const express = require("express");
-const bodyParser = require("body-parser");
 const fs = require('fs');
 const path = require('path');
 const { WebClient } = require("@slack/web-api");
-const crypto = require('crypto');
+const { SocketModeClient } = require("@slack/socket-mode");
 
 const PINNED_DATA_DIR = path.join(process.cwd(), 'data');
 const PINNED_TS_FILE = path.join(PINNED_DATA_DIR, 'pinned_messages.json');
@@ -12,7 +11,7 @@ const PINNED_TS_FILE = path.join(PINNED_DATA_DIR, 'pinned_messages.json');
 const app = express();
 const port = process.env.PORT || 3000;
 const token = process.env.SLACK_BOT_TOKEN;
-const signingSecret = process.env.SLACK_SIGNING_SECRET;
+const appToken = process.env.SLACK_APP_TOKEN;
 const web = new WebClient(token, {
     timeout: 10000,
 });
@@ -51,61 +50,9 @@ function rateLimitMiddleware(req, res, next) {
     next();
 }
 
-// Default body parser - capture raw body for Slack signature verification
-app.use(bodyParser.urlencoded({
-    extended: true,
-    verify: (req, res, buf, encoding) => {
-        req.rawBody = buf.toString(encoding || 'utf8');
-    }
-}));
-
-// Slack signature verification middleware
-function verifySlackSignature(req, res, next) {
-    if (!signingSecret) {
-        console.error('SLACK_SIGNING_SECRET not configured');
-        return res.status(500).send('Server configuration error');
-    }
-
-    const slackSignature = req.headers['x-slack-signature'];
-    const timestamp = req.headers['x-slack-request-timestamp'];
-    
-    if (!slackSignature || !timestamp) {
-        console.log('Missing Slack headers - rejecting request');
-        return res.status(400).send('Missing Slack headers');
-    }
-
-    // Prevent replay attacks (timestamp older than 5 minutes)
-    if (Math.abs(Date.now() / 1000 - timestamp) > 300) {
-        console.log('Request too old - rejecting');
-        return res.status(400).send('Request too old');
-    }
-
-    // Get raw body for signature verification
-    let rawBody;
-    if (req.rawBody) {
-        rawBody = req.rawBody;
-    } else if (req.body && typeof req.body === 'object') {
-        // Convert parsed body back to raw format
-        rawBody = Object.keys(req.body).map(key => `${encodeURIComponent(key)}=${encodeURIComponent(req.body[key])}`).join('&');
-    } else {
-        console.log('Unable to get raw body for signature verification');
-        return res.status(400).send('Invalid request format');
-    }
-
-    // Create expected signature
-    const sigBasestring = `v0:${timestamp}:${rawBody}`;
-    const expectedSignature = 'v0=' + crypto
-        .createHmac('sha256', signingSecret)
-        .update(sigBasestring)
-        .digest('hex');
-
-    if (slackSignature !== expectedSignature) {
-        console.log('Invalid signature - rejecting request');
-        return res.status(401).send('Invalid signature');
-    }
-
-    console.log('✅ Signature verified successfully');
-    next();
+const slackHandlers = {};
+function onSlack(key, handler) {
+    slackHandlers[key] = handler;
 }
 
 // Health check endpoint
@@ -142,7 +89,7 @@ app.get('/health', async (req, res) => {
 
 // Simple readiness check
 app.get('/ready', (req, res) => {
-    if (!token || !signingSecret) {
+    if (!token || !appToken) {
         return res.status(503).json({ status: 'not_ready' });
     }
     res.json({ status: 'ready' });
@@ -875,7 +822,7 @@ function parseTimeToEpoch(timeStr, userTimezone) {
     return target.getTime() - tzOffset;
 }
 
-app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, res) => {
+onSlack("/env-request", async (req, res) => {
     const { user_id, user_name, channel_id, text } = req.body;
     
     // Slash commands must be run in a channel (not DM) - DMs have channel_id starting with 'D'
@@ -1161,7 +1108,7 @@ app.post("/env-request", verifySlackSignature, rateLimitMiddleware, async (req, 
     return res.send("");
 });
 
-app.post("/env-release", verifySlackSignature, rateLimitMiddleware, async (req, res) => {
+onSlack("/env-release", async (req, res) => {
     const { user_id, channel_id } = req.body;
 
     if (!channel_id || channel_id.startsWith('D')) {
@@ -1295,8 +1242,8 @@ async function remindUserToExtend(user_id, channel_id) {
 }
 
 // Update the interactions endpoint to handle queue join and notify current reservation holder
-app.post("/slack/interactions", verifySlackSignature, rateLimitMiddleware, bodyParser.json(), async (req, res) => {
-    const payload = JSON.parse(req.body.payload);
+onSlack("interactive", async (req, res) => {
+    const payload = req.body;
     const { user, actions } = payload;
     
     try {
@@ -1981,7 +1928,7 @@ async function releaseEnvironment(user_id, channel_id) {
 }
 
 // Update the env-leave-queue endpoint to notify other queue members
-app.post("/env-leave-queue", verifySlackSignature, rateLimitMiddleware, async (req, res) => {
+onSlack("/env-leave-queue", async (req, res) => {
     const { user_id, user_name, channel_id } = req.body;
     
     if (!channel_id || channel_id.startsWith('D')) {
@@ -2070,7 +2017,7 @@ async function notifyQueueMembersOfUpdate(oldQueue, departedUserName, channel_id
     }
 }
 
-app.post("/env-status", verifySlackSignature, rateLimitMiddleware, (req, res) => {
+onSlack("/env-status", (req, res) => {
     const { channel_id } = req.body;
 
     if (!channel_id || channel_id.startsWith('D')) {
@@ -2145,11 +2092,46 @@ process.on('uncaughtException', (error) => {
     process.exit(1);
 });
 
+const socket = new SocketModeClient({ appToken });
+
+socket.on('slack_event', async ({ type, body, ack }) => {
+    const handler = slackHandlers[type === 'slash_commands' ? body.command : type];
+    if (!handler) return ack();
+
+    let acked = false;
+    const res = {
+        status: () => res,
+        send: (text) => {
+            if (acked) return;
+            acked = true;
+            return ack(text ? { text } : undefined);
+        },
+    };
+    const req = { body };
+
+    try {
+        let allowed = false;
+        rateLimitMiddleware(req, res, () => { allowed = true; });
+        if (allowed) await handler(req, res);
+    } catch (error) {
+        console.error(`Error handling ${type}:`, error);
+    }
+    if (!acked) await res.send();
+});
+
 app.listen(port, async () => {
-    console.log(`Server running on port ${port}`);
-    
-    // Recover any existing reservations after restart
+    console.log(`Health server running on port ${port}`);
+
     console.log('🔄 Checking for existing reservations...');
     await recoverReservationState();
     console.log('✅ Startup recovery complete');
+
+    try {
+        await socket.start();
+        console.log('🔌 Connected to Slack via Socket Mode');
+    } catch (error) {
+        // Exit so the orchestrator restarts us; staying up would pass /ready while ignoring every command.
+        console.error('Socket Mode connection failed:', error);
+        process.exit(1);
+    }
 });

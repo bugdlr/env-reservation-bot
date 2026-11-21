@@ -6,18 +6,24 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node test-validation.js && node test-signature.js && node test-scheduling.js",
+    "test": "node test-validation.js && node test-scheduling.js && node test-socket.js",
     "health": "curl http://localhost:3000/health"
   },
-  "keywords": ["slack", "bot", "environment", "devops", "sdlc"],
+  "keywords": [
+    "slack",
+    "bot",
+    "environment",
+    "devops",
+    "sdlc"
+  ],
   "author": "Hannah de los Reyes",
   "license": "ISC",
   "engines": {
     "node": ">=22.0.0"
   },
   "dependencies": {
+    "@slack/socket-mode": "^2.0.7",
     "@slack/web-api": "^7.9.1",
-    "body-parser": "^2.2.0",
     "dotenv": "^16.4.7",
     "express": "^5.1.0"
   }

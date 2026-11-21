@@ -18,47 +18,46 @@ A Slack bot for managing shared environment reservations. Teams can reserve, que
 
 Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app.
 
-### 2. Configure Bot Token Scopes
+### 2. Enable Socket Mode
+
+Under **Socket Mode**, turn it on and generate an App-Level Token with the `connections:write` scope. The bot connects out to Slack over a WebSocket, so it needs no public URL.
+
+### 3. Configure Bot Token Scopes
 
 Under **OAuth & Permissions**, add these Bot Token Scopes:
 
 - `channels:read`
 - `channels:history`
-- `channels:write`
+- `channels:write.topic`
 - `chat:write`
 - `pins:write`
 - `im:write`
 - `users:read` (required for timezone detection)
 
-### 3. Create Slash Commands
+### 4. Create Slash Commands and Enable Interactivity
 
-Under **Slash Commands**, create these four commands. Each one's Request URL is its own path:
+Under **Slash Commands**, create these four commands. With Socket Mode on, no Request URL is needed:
 
-| Command | Request URL | Description |
-|---------|-------------|-------------|
-| `/env-request` | `https://your-domain.com/env-request` | Reserve an environment or join the queue |
-| `/env-release` | `https://your-domain.com/env-release` | Release your current reservation |
-| `/env-leave-queue` | `https://your-domain.com/env-leave-queue` | Leave the waiting queue |
-| `/env-status` | `https://your-domain.com/env-status` | Show current environment status |
+| Command | Description |
+|---------|-------------|
+| `/env-request` | Reserve an environment or join the queue |
+| `/env-release` | Release your current reservation |
+| `/env-leave-queue` | Leave the waiting queue |
+| `/env-status` | Show current environment status |
 
-### 4. Enable Interactivity
-
-Under **Interactivity & Shortcuts**, set the Request URL to:
-```
-https://your-domain.com/slack/interactions
-```
+Under **Interactivity & Shortcuts**, turn Interactivity on.
 
 ### 5. Install and Configure
 
 ```bash
 cp environment-template.txt .env
-# Edit .env with your Slack bot token and signing secret
+# Edit .env with your bot token and app-level token
 
 npm install
 npm start
 ```
 
-The bot runs on port 3000 by default.
+Port 3000 serves only the `/health` and `/ready` checks; Slack traffic goes over the Socket Mode connection.
 
 ## Usage
 
@@ -97,15 +96,15 @@ If you don't respond within 3 minutes, the environment is automatically reserved
 
 ## Deployment
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed instructions covering Docker, traditional servers, and cloud platforms.
+See [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Configuration
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SLACK_BOT_TOKEN` | Yes | Bot User OAuth Token (`xoxb-...`) |
-| `SLACK_SIGNING_SECRET` | Yes | App signing secret for request verification |
-| `PORT` | No | Server port (default: `3000`) |
+| `SLACK_APP_TOKEN` | Yes | App-Level Token for Socket Mode (`xapp-...`) |
+| `PORT` | No | Health check port (default: `3000`) |
 | `MONITORED_CHANNELS` | No | Comma-separated channel IDs to check on startup |
 
 **Note:** The `users:read` OAuth scope is required for timezone detection when scheduling reservations.
